@@ -29,6 +29,10 @@ class LogStash::Outputs::Graphite < LogStash::Outputs::Base
   # Should metrics be resent on failure?
   config :resend_on_failure, :validate => :boolean, :default => false
 
+  # Maximum number of events to hold in the output queue. If the queue is full,
+  # the oldest event will be dropped to make room for the new one.
+  config :queue_max_size, :validate => :number, :default => 1000
+
   # The metric(s) to use. This supports dynamic strings like %{host}
   # for metric names and also for values. This is a hash field with key
   # being the metric name, value being the metric value. Example:
@@ -86,14 +90,24 @@ class LogStash::Outputs::Graphite < LogStash::Outputs::Base
       @metrics_format = DEFAULT_METRICS_FORMAT
     end
 
-    connect
+    @queue = SizedQueue.new(@queue_max_size)
+    @worker_thread = Thread.new do
+      connect
+      process_queue
+    end
+  end
+
+  def close
+    @queue.push(:shutdown)
+    @worker_thread.join
+    super
   end
 
   def connect
     # TODO(sissel): Test error cases. Catch exceptions. Find fortune and glory. Retire to yak farm.
     begin
       @socket = TCPSocket.new(@host, @port)
-    rescue Errno::ECONNREFUSED => e
+    rescue Errno::ECONNREFUSED, SocketError => e
       @logger.warn("Connection refused to graphite server, sleeping...", :host => @host, :port => @port)
       sleep(@reconnect_interval)
       retry
@@ -110,6 +124,28 @@ class LogStash::Outputs::Graphite < LogStash::Outputs::Base
   end
 
   def receive(event)
+    if @queue.size >= @queue_max_size
+      @queue.pop(true)
+      @logger.warn("Graphite output queue full (#{@queue_max_size}); oldest event dropped")
+    end
+    @queue.push(event, true)
+  rescue ThreadError
+    retries = (retries || 0) + 1
+    retry if retries <= 10
+    @logger.warn("Could not enqueue event; event discarded")
+  end
+
+  private
+
+  def process_queue
+    loop do
+      event = @queue.pop
+      break if event == :shutdown
+      process_event(event)
+    end
+  end
+
+  def process_event(event)
     # Graphite message format: metric value timestamp\n
 
     # compact to remove nil messages which produces useless \n
@@ -142,8 +178,6 @@ class LogStash::Outputs::Graphite < LogStash::Outputs::Base
       end
     end
   end
-
-  private
 
   def messages_from_event_fields(event, include_metrics, exclude_metrics)
     @logger.debug? && @logger.debug("got metrics event", :metrics => event.to_hash)
